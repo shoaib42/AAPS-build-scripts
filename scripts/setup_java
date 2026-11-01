@@ -1,0 +1,158 @@
+#!/usr/bin/bash
+
+function update_alt() {
+    local bpath=$1
+    local binary=$2
+
+    update-alternatives --set ${binary} ${bpath}
+    if [ $? -ne 0 ]; then
+        echo "Failed to set ${binary} alternative. Please check your installation."
+        return 1
+    fi
+    return 0
+
+}
+
+function install_java() {
+
+    local arch=$(uname -m)
+
+    if [ "$PACKAGE_MANAGER" == "apt" ]; then
+        pkg_install openjdk-${_JAVA_VERSION}-jdk
+        case $arch in
+        x86_64) archstr="amd64" ;;
+        aarch64) archstr="arm64" ;;
+        i386) archstr="i386" ;;
+        *)
+            echo "Unknown architecture: $arch. Proceeding with default settings."
+            archstr="$arch"
+            ;;
+        esac
+        local jbinpath=/usr/lib/jvm/java-${_JAVA_VERSION}-openjdk-${archstr}/bin
+        update_alt $jbinpath/java java && update_alt $jbinpath/javac javac
+        return $?
+    elif [ "$PACKAGE_MANAGER" == "dnf" ]; then
+        pkg_install java-${_JAVA_VERSION}-openjdk-devel
+        local jbinpath="java-${_JAVA_VERSION}-openjdk.${arch}"
+        update_alt "$jbinpath" java && update_alt "$jbinpath" javac
+        return $?
+    else
+        echo "Unsupported package manager. Please install Java manually."
+        return 1
+    fi
+    
+    
+}
+
+function check_java_install() {
+    if command -v java &>/dev/null; then
+        local INSTALLED_JAVA_VERSION=$(java -version 2>&1 | head -n 1 | awk -F '"' '{print $2}' | cut -d'.' -f1)
+        if [[ "$INSTALLED_JAVA_VERSION" != "$_JAVA_VERSION" ]]; then
+            echo "Java version mismatch. Installing required version: $_JAVA_VERSION"
+            install_java "$_JAVA_VERSION"
+        else
+            echo "Java $_JAVA_VERSION is already installed."
+        fi
+    else
+        echo "Java not installed. Installing version: $_JAVA_VERSION"
+        install_java "$_JAVA_VERSION"
+        if [ $? -ne 0 ]; then
+            return 1
+        fi
+    fi
+    return 0
+}
+
+function setup_java_tools() {
+
+    print_step "Install/Update Java and commandline tools"
+
+    unset COMPILE_SDK
+    local COMPILE_SDK_L=$(grep -oP "const val compileSdk = \K[0-9]+" "$VERSIONS_FILE")
+    local NDK_VERSION=$(grep -oP 'const val ndkVersion = "\K[^\"]+' "$VERSIONS_FILE")
+
+
+    if [[ "$COMPILE_SDK_L" =~ ^[0-9]+$ ]] && [ "$COMPILE_SDK_L" -ge 37 ]; then
+        COMPILE_SDK_L="${COMPILE_SDK_L}.0"
+    fi
+
+    NDK_VERSION=${NDK_VERSION:-$LATEST_NDK}
+
+    if [[ -f "$JDK_MAP_FILE" ]]; then
+        export _JAVA_VERSION=$(jq -r '.default // empty' "$JDK_MAP_FILE")
+        echo "Parsed Java version from $JDK_MAP_FILE: >>$_JAVA_VERSION<<"
+    fi
+    #legacy fall back
+    if [[ -z "$_JAVA_VERSION" ]]; then
+        export _JAVA_VERSION=$(grep -oP 'val javaVersion = JavaVersion.VERSION_\K[0-9]+' "$VERSIONS_FILE")
+        echo "Parsed Java version from $VERSIONS_FILE: >>$_JAVA_VERSION<<"
+    fi
+
+    # Java version handling
+    if [ -z "$_JAVA_VERSION" ]; then
+        echo "Failed to determine Java version. Please check $JDK_MAP_FILE and $VERSIONS_FILE."
+        return 1
+    fi
+    check_java_install
+    if [ $? -ne 0 ]; then
+        return 1
+    fi
+    
+    local COMPILE_SDK_LT=$($SDKMANAGER_PATH --list --sdk_root=$TOOLS_DIR  2>/dev/null | grep "build-tools;$COMPILE_SDK_L" | grep -v rc | grep -oP '[^;]+;\K(\S+)' | sort -r | head -1)
+
+    local required_tools=("platform-tools" "build-tools;$COMPILE_SDK_LT" "platforms;android-$COMPILE_SDK_L" "ndk;$NDK_VERSION")
+    local install_list=()
+
+
+    echo "Checking installed tools..."
+    local installed_tools=$($SDKMANAGER_PATH --list --sdk_root=$TOOLS_DIR --channel=0 2>/dev/null |
+        sed -e '/Available Packages/q' |
+        grep -oP '^\s+\K(\S+)' |
+        sed '1,2d' |
+        xargs)
+
+    echo "Installed tools: $installed_tools"
+
+    # Loop through required tools
+    for tool in "${required_tools[@]}"; do
+        echo "Checking $tool"
+        if ! echo "$installed_tools" | grep -qw "$tool"; then
+            install_list+=("$tool")
+        else
+            echo "$tool is already installed"
+        fi
+    done
+
+    # Install only the missing tools
+    if [ ${#install_list[@]} -eq 0 ]; then
+        echo "All required tools are already installed."
+    else
+        echo "Installing missing tools: ${install_list[*]}"
+        yes | $SDKMANAGER_PATH --sdk_root=$TOOLS_DIR "${install_list[@]}"
+        if [ $? -eq 0 ]; then
+            echo "Tools installed successfully!"
+            # accept all licesnses
+            yes | $SDKMANAGER_PATH --licenses --sdk_root=$TOOLS_DIR || {
+                echo "Failed to accept required licenses. Manual intervention may be required."
+                return 1
+            }
+            echo "Required licenses accepted successfully!"
+        else
+            echo "Failed to install tools: ${install_list[*]}"
+            return 1
+        fi
+        echo "Will require a clean cache and rebuild, setting FORCE_REBUILD and clearing cache now"
+        FORCE_REBUILD=true
+        FORCE_CLEAN_CACHE=true
+        force_clean_cache_fn
+    fi
+
+
+    export ANDROID_HOME=$TOOLS_DIR
+    export PATH=$ANDROID_HOME/cmdline-tools/bin:$ANDROID_HOME/platform-tools:$PATH
+
+    export COMPILE_SDK="$COMPILE_SDK_LT"
+    echo "Environment variables set: COMPILE_SDK=$COMPILE_SDK"
+    echo "ANDROID_HOME set to $ANDROID_HOME"
+    return 0
+}

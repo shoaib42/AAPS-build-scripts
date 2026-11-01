@@ -1,0 +1,166 @@
+#!/bin/bash
+
+source platform
+
+function _mirror_xdrip() {
+    print_step "Mirror xdrip+"
+    local REPO="NightscoutFoundation/xDrip"
+    local API_URL="https://api.github.com/repos/$REPO/releases/latest"
+    local BASE_DIR="${OUTPUT_DIR}/xdrip"
+
+    # Fetch latest release tag
+    local LATEST_TAG=$(curl -s "$API_URL" | jq -r '.tag_name')
+    local TAG_FILE="$BASE_DIR/latest_tag.txt"
+    local DOWNLOAD_DIR="$BASE_DIR/$LATEST_TAG"
+
+    mkdir -p "$DOWNLOAD_DIR"
+
+    # If already processed, check integrity before skipping
+    if [[ -f "$TAG_FILE" ]] && [[ "$(cat "$TAG_FILE")" == "$LATEST_TAG" ]]; then
+        echo "Already up to date: $LATEST_TAG. Verifying files..."
+    fi
+
+    # Fetch latest release info
+    local RELEASE_DATA=$(curl -s "$API_URL")
+    local ALL_SUCCESS=1
+
+    echo "Downloading APKs for release: $LATEST_TAG"
+
+    # Process each APK
+    echo "$RELEASE_DATA" | jq -c '.assets[] | select(.name | endswith(".apk"))' | while read -r asset; do
+        local URL=$(echo "$asset" | jq -r '.browser_download_url')
+        local FILENAME="$DOWNLOAD_DIR/$(basename "$URL")"
+        local EXPECTED_SIZE=$(echo "$asset" | jq -r '.size')
+
+        # Check if file exists and verify its integrity
+        if [[ -f "$FILENAME" ]]; then
+            local ACTUAL_SIZE=$(stat --format="%s" "$FILENAME" 2>/dev/null || stat -f%z "$FILENAME")
+
+            if [[ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]]; then
+                echo "Verified: $(basename "$URL")"
+                continue
+            else
+                echo "File mismatch, re-downloading: $(basename "$URL")"
+                rm -f "$FILENAME"
+            fi
+        fi
+
+        # Download file
+        echo "Fetching: $URL"
+        curl -L -o "$FILENAME" "$URL"
+
+        # Verify size after download
+        local NEW_SIZE=$(stat --format="%s" "$FILENAME" 2>/dev/null || stat -f%z "$FILENAME")
+
+        if [[ "$NEW_SIZE" -ne "$EXPECTED_SIZE" ]]; then
+            echo "Download failed: $(basename "$URL")"
+            rm -f "$FILENAME"
+            ALL_SUCCESS=0
+        else
+            echo "Successfully downloaded: $(basename "$URL")"
+        fi
+    done
+
+    # Update latest tag only if all downloads were successful
+    if [[ "$ALL_SUCCESS" -eq 1 ]]; then
+        echo "$LATEST_TAG" > "$TAG_FILE"
+	ln -sf "$DOWNLOAD_DIR" "$BASE_DIR/latest"
+        echo "Mirror complete: Files saved in $DOWNLOAD_DIR"
+    else
+        echo "Some files failed to download correctly. Retrying on next run."
+    fi
+}
+
+function _mirror() {
+    local REPO="$1"
+    local BASE_DIR="${OUTPUT_DIR}/$2"
+    local API_URL="https://api.github.com/repos/$REPO/releases"
+    local INCLUDE_PRERELEASES="${3:-false}"
+    local LATEST_TAG
+    if [[ $INCLUDE_PRERELEASES == "false" ]] ; then
+        API_URL="${API_URL}/latest"
+        JQSTR='.assets[] | select(.name | endswith(".apk"))'
+        LATEST_TAG=$(curl -s "$API_URL" | jq -r '.tag_name')
+    else
+        JQSTR='.[0].assets[] | select(.name | endswith(".apk"))'
+        LATEST_TAG=$(curl -s "$API_URL" | jq -r '.[0].tag_name')
+    fi
+    
+    local TAG_FILE="$BASE_DIR/latest_tag.txt"
+    local DOWNLOAD_DIR="$BASE_DIR/$LATEST_TAG"
+
+    mkdir -p "$DOWNLOAD_DIR"
+
+    # If already processed, check integrity before skipping
+    if [[ -f "$TAG_FILE" ]] && [[ "$(cat "$TAG_FILE")" == "$LATEST_TAG" ]]; then
+        echo "Already up to date: $LATEST_TAG. Verifying files..."
+    fi
+
+    # Fetch latest release info
+    local RELEASE_DATA=$(curl -s "$API_URL")
+    local ALL_SUCCESS=1
+
+    echo "Downloading APKs for release: $LATEST_TAG"
+
+    # Process each APK
+    echo "$RELEASE_DATA" | jq -c "$JQSTR" | while read -r asset; do
+        local URL=$(echo "$asset" | jq -r '.browser_download_url')
+        local FILENAME="$DOWNLOAD_DIR/$(basename "$URL")"
+        local EXPECTED_SIZE=$(echo "$asset" | jq -r '.size')
+
+        # Check if file exists and verify its integrity
+        if [[ -f "$FILENAME" ]]; then
+            local ACTUAL_SIZE=$(stat --format="%s" "$FILENAME" 2>/dev/null || stat -f%z "$FILENAME")
+
+            if [[ "$ACTUAL_SIZE" -eq "$EXPECTED_SIZE" ]]; then
+                echo "Verified: $(basename "$URL")"
+                continue
+            else
+                echo "File mismatch, re-downloading: $(basename "$URL")"
+                rm -f "$FILENAME"
+            fi
+        fi
+
+        # Download file
+        echo "Fetching: $URL"
+        curl -L -o "$FILENAME" "$URL"
+
+        # Verify size after download
+        local NEW_SIZE=$(stat --format="%s" "$FILENAME" 2>/dev/null || stat -f%z "$FILENAME")
+
+        if [[ "$NEW_SIZE" -ne "$EXPECTED_SIZE" ]]; then
+            echo "Download failed: $(basename "$URL")"
+            rm -f "$FILENAME"
+            ALL_SUCCESS=0
+        else
+            echo "Successfully downloaded: $(basename "$URL")"
+        fi
+    done
+
+    # Update latest tag only if all downloads were successful
+    if [[ "$ALL_SUCCESS" -eq 1 ]]; then
+        echo "$LATEST_TAG" > "$TAG_FILE"
+	    ln -nsf "$LATEST_TAG" "$BASE_DIR/latest"
+        echo "Mirror complete: Files saved in $DOWNLOAD_DIR"
+    else
+        echo "Some files failed to download correctly. Retrying on next run."
+    fi
+}
+
+function mirror_xdrip_nightly() {
+    print_step "Mirror xdrip+"
+    local REPO="NightscoutFoundation/xDrip"
+    _mirror $REPO "xdrip-pre" true
+}
+
+function mirror_xdrip() {
+    print_step "Mirror xdrip+"
+    local REPO="NightscoutFoundation/xDrip"
+    _mirror $REPO "xdrip"
+}
+
+function mirror_DiaKEM_G7() {
+    print_step "Mirror DiaKEM_G7"
+    local REPO="authorgambel/DiaKEM_G7"
+    _mirror $REPO "diakem"
+}

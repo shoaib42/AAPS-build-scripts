@@ -1,0 +1,83 @@
+#!/usr/bin/bash
+
+source conf
+
+PKGS=("wget" "git" "unzip" "grep" "jq")
+
+if command -v apt &>/dev/null; then
+    PACKAGE_MANAGER="apt"
+    INSTALL_CMD="sudo apt install -y"
+    APT_UPDATED=""
+    CHOWN_WEB_USR=www-data
+    CHOWN_WEB_GRP=www-data
+elif command -v dnf &>/dev/null; then
+    PACKAGE_MANAGER="dnf"
+    INSTALL_CMD="sudo dnf install -y"
+    APT_UPDATED=1
+    CHOWN_WEB_USR=apache
+    CHOWN_WEB_GRP=apache
+    PKGS+=("chkconfig")
+else
+    echo "Neither apt nor dnf found. This script supports apt (Debian-based) and dnf (Red Hat-based) systems only."
+    exit 1
+fi
+VER_OUT_DIR="$OUTPUT_DIR/aaps"
+
+FORCE_REBUILD=false
+FORCE_CLEAN_CACHE=false
+REINSTALL_CMDTOOLS=false
+
+mkdir -p "$VER_OUT_DIR"
+
+function print_step() {
+    local message=$1
+    echo
+    echo
+    echo "-----------------------------------------"
+    echo $message
+    echo "-----------------------------------------"
+}
+
+function notify() {
+    local msg="$1"
+    local topic="$2"
+    local tags="$3"
+    
+    if [[ -z "${NTFY:-}" || "$NTFY" != "yes" ]]; then
+      return
+    fi
+    curl -sS --fail -m 10 \
+        -H@$NTFY_TOKEN \
+        -H "Content-Type: text/plain" \
+        -H "t: AAPS build" \
+        -H "Markdown: yes" \
+        -H "ta: ${tags}" \
+        -d "$msg" \
+        ${NTFY_URL}/${topic} \
+        || echo "ntfy alert FAILED to send: ${msg}"
+}
+
+function notify_success() {
+    notify "$1" "$NTFY_SUCCES_TOPIC" "tada"
+}
+
+function notify_exit() {
+    notify "$1" "$NTFY_ERR_TOPIC" "skull"
+    exit 1
+}
+
+function pkg_install() {
+    #local packages=$1
+    local pkgs=("$@")
+    if [ -z "$APT_UPDATED" ]; then
+        apt update
+        export APT_UPDATED=1
+    fi
+    #$INSTALL_CMD "$packages"
+    $INSTALL_CMD "${pkgs[@]}"
+    return $?
+}
+
+source setup_stack
+source setup_java
+source buildprep

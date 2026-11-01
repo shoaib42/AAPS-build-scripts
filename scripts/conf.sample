@@ -1,0 +1,98 @@
+#!/bin/bash
+
+ROOT_DIR=/opt/AAPS
+
+#Source code git
+SOURCE_DIR="$ROOT_DIR/AndroidAPS"
+VERSIONS_FILE="$SOURCE_DIR/buildSrc/src/main/kotlin/Versions.kt"
+JDK_MAP_FILE="$SOURCE_DIR/.github/jdk-map.json"
+
+
+BUILD_CACHE_DIR="$ROOT_DIR/.cache"
+
+export GRADLE_USER_HOME="$BUILD_CACHE_DIR/gradle"
+export ANDROID_USER_HOME="$BUILD_CACHE_DIR/android"
+export ANDROID_EMULATOR_HOME="$BUILD_CACHE_DIR/android"
+export ANDROID_AVD_HOME="$BUILD_CACHE_DIR/android/avd"
+export KOTLIN_USER_HOME="$BUILD_CACHE_DIR/kotlin"
+
+# Create the target directory structure
+mkdir -p "$GRADLE_USER_HOME" "$ANDROID_USER_HOME" "$KOTLIN_USER_HOME"
+
+# Calculate 50% of available CPU cores
+WORKER_COUNT=$(( $(nproc) / 2 ))
+
+HEAP_SZ=$(awk '/MemTotal/ { print int(($2/1024 - 6144)/1024) }' /proc/meminfo)
+if [ "$HEAP_SZ" -lt 3 ]; then
+    HEAP_SZ=3
+fi
+
+cat << EOF > "$GRADLE_USER_HOME/gradle.properties"
+org.gradle.jvmargs=-Xmx${HEAP_SZ}g -XX:MaxMetaspaceSize=1g -XX:+UseG1GC
+
+org.gradle.workers.max=${WORKER_COUNT}
+org.gradle.parallel=true
+
+org.gradle.daemon=false
+org.gradle.caching=true
+kotlin.compiler.execution.strategy=in-process
+EOF
+
+unset WORKER_COUNT
+unset HEAP_SZ
+
+#Key
+KEYSTORE_DIR="$ROOT_DIR/keystores"
+KEYSTORE_FILE="$KEYSTORE_DIR/APPSKeystore.jks"
+KEY_ALIAS="key0"
+KEYSTORE_PASSWORD="passwd"
+KEY_PASSWORD=$KEYSTORE_PASSWORD
+NAME="Name"
+ORG="Home"
+CITY="City"
+STATE_PROV="State"
+COUNTRY_CODE="CountryCode"
+DNAME="CN=$NAME, OU=$ORG, O=$ORG, L=$CITY, ST=$STATE_PROV, C=$COUNTRY_CODE"
+
+#cmdtools
+CMDTOOLS_LINUX="https://dl.google.com/android/repository/commandlinetools-linux-15859902_latest.zip"
+LATEST_NDK="27.3.13750724"
+TOOLS_DIR="$ROOT_DIR/android-sdk"
+SDKMANAGER_PATH="$TOOLS_DIR/cmdline-tools/bin/sdkmanager"
+
+#build dir
+OUTPUT_DIR=$ROOT_DIR/build
+mkdir -p "$OUTPUT_DIR"
+
+#ntfy if you want to get notification of builds
+NTFY=no #needs explicit yes to enable
+#following only has effect if NTFY is set to yes
+NTFY_URL=https://ntfy.mydomain.tld/
+# the token file is the header entry and has to be of the format
+# Authorization: Bearer tk_....token.....
+# Replace tk_....token..... with the token you generate on ntfy
+NTFY_TOKEN=$HOME/.ntfy/ntfy_curl
+# Two different topic, but you can share them, and set the same topic for both
+# Helps if there are more than one subscribers, for caregivers this is helpful
+NTFY_ERR_TOPIC=my-issues
+NTFY_SUCCES_TOPIC=aaps-builds
+
+#rsync if you want to move 
+RSYNC=no #needs explicit yes to enable
+#This number represents the latest N builds to rysnc, and will prune the older ones with --delete-after
+# The remote will have at max NUMKEEP latest builds
+NUMKEEP=3
+#following only has effect if RSYNC is set to yes
+# the remote can be limited to rsync to a specific directory with the following authorized_keys entry
+# command="rrsync /path/to/where/builds/go",no-agent-forwarding,no-port-forwarding,no-pty,no-user-rc,no-X11-forwarding ssh-ed25519 ...pub...key.......... root@mybuildlxc
+SSH_KEY="$ROOT_DIR/.ssh/id_ed25519_worker"
+#If you don't restrict the location with the authroized_key, then you can set the location in REMOTE_LOC
+REMOTE_LOC=
+VPS_USER=rsyncuser
+VPS_HOST=192.168.0.127
+#If the destination is a directory listing for web server
+# and you have ntfy, then you can send a notification with
+# the download link to yourself
+# CAUTION!!!! FRONT THIS with some Authorization and Authentication
+# Your builds shouldn't be used by others, use basic auth, oidc/webauthn or whatever floats your boat
+DL_PATH=https://domain.tld/apks

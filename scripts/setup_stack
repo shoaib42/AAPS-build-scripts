@@ -1,0 +1,72 @@
+#!/usr/bin/bash
+
+function _install_cmd_tools() {
+    now_date=$(date +%s)
+    TEMP_DIR="/tmp/$now_date"
+    mkdir -p "$TEMP_DIR" && cd "$TEMP_DIR" || {
+        echo "Failed to create temp or change directory $TEMP_DIR."
+        return 3
+    }
+
+    # Download the tools zip file
+    if [ -z "$CMDTOOLS_LINUX" ]; then
+        echo "Error: CMDTOOLS_LINUX variable is not set. Please define it in deps.sh."
+        return 4
+    fi
+
+    echo "Downloading tools from $CMDTOOLS_LINUX..."
+    wget "$CMDTOOLS_LINUX" -O tools.zip || {
+        echo "Failed to download tools."
+        return 5
+    }
+
+    # Unzip the tools to TOOLS_DIR
+    if [ -z "$TOOLS_DIR" ]; then
+        echo "Error: TOOLS_DIR variable is not set. Please define it in deps.sh."
+        return 6
+    fi
+
+    echo "Unzipping tools to $TOOLS_DIR..."
+    mkdir -p "$TOOLS_DIR" || {
+        echo "Failed to create tools directory $TOOLS_DIR."
+        return 7
+    }
+    unzip tools.zip -d "$TOOLS_DIR" || {
+        echo "Failed to unzip tools."
+        return 8
+    }
+
+    echo "Tools installed successfully to $TOOLS_DIR."
+
+    rm -rf "$TEMP_DIR"
+    echo "Cleaned up temporary directory $TEMP_DIR."
+
+    return 0
+}
+
+function install_soft_stack() {
+
+    print_step "Install software"
+
+    pkg_install "${PKGS[@]}" || {
+        echo "Failed to install required packages." >&2
+        return 2
+    }
+
+    if [ "$REINSTALL_CMDTOOLS" == "true" ] && [ -d "$TOOLS_DIR/cmdline-tools" ]; then
+        echo "Reinstall cmdtools enabled. Removing existing cmdline-tools directory..."
+        rm -rf "$TOOLS_DIR" || {
+            echo "Failed to remove $TOOLS_DIR/cmdline-tools."
+            return 1
+        }
+    fi
+
+    if [ -f "$SDKMANAGER_PATH" ]; then
+        echo "SDK Manager already exists at $SDKMANAGER_PATH. Skipping download."
+        return 0
+    fi
+
+    _install_cmd_tools
+    return $?
+
+}

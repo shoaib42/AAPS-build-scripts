@@ -1,0 +1,54 @@
+#!/usr/bin/bash
+
+source platform
+function _sync() {
+    local LOCATION=$1
+    local REMOTE_LOCATION=$2
+    local INFO_FILE=$3
+    local NOTIFY=${4:-}
+    local rlog rc vers
+    print_step "Syncing top $NUMKEEP builds to VPS and deleting old releases"
+
+    local remote_target="${VPS_USER}@${VPS_HOST}:/$REMOTE_LOCATION"
+    
+    local topn_dirs
+    topn_dirs=$(find "$LOCATION" -mindepth 1 -maxdepth 1 -type d ! -name "latest" -printf "%f\n" | \
+        sort -rV | head -n $NUMKEEP)
+
+    local rsync_args=(
+        -avz
+        --delete-after
+        -e "ssh -i $SSH_KEY -o StrictHostKeyChecking=accept-new"
+    )
+
+    rsync_args+=( --include="/$INFO_FILE" )
+    rsync_args+=( --include="/latest" )
+
+    rlog=$(mktemp)
+    rsync_args+=( --log-file="$rlog" --log-file-format='%i %n' )
+
+    for dir in $topn_dirs; do
+        echo "Including build directory in sync: $dir"
+        rsync_args+=( --include="/$dir/***")
+    done
+
+    rsync_args+=( --exclude="*" )
+
+    rsync "${rsync_args[@]}" "$LOCATION/" "$remote_target"
+    rc=$?
+
+    if [ $rc -eq 0 ] && [ -n "$NOTIFY" ]; then
+        vers=$(grep -E '<f\S+ \S+\.apk$' "$rlog" | awk '{print $NF}' | cut -d/ -f1 | sort -uV | paste -sd' ')
+        [ -n "$vers" ] && \
+        notify_success "New version of AAPS available: [App $vers](${DL_PATH}/aaps/${vers}/AAPS/app-full-release_${vers}.apk)" && \
+        notify_success "New version of Client available: [ClientApp $vers](${DL_PATH}/aaps/${vers}/AAPSClient/app-aapsclient-release_${vers}.apk)"
+    fi
+    rm -f "$rlog"
+    return $rc
+}
+
+function sync_and_prune_vps() {
+    REMOTE_LOC="${REMOTE_LOC%/}"
+    _sync "$VER_OUT_DIR" "${REMOTE_LOC:+${REMOTE_LOC}/}aaps" "last_ver_epoch.txt" "notify"
+    _sync "${OUTPUT_DIR}/xdrip" "${REMOTE_LOC:+${REMOTE_LOC}/}xdrip" "latest_tag.txt"
+}

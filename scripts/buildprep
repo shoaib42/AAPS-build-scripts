@@ -1,0 +1,416 @@
+#!/usr/bin/bash
+
+declare -A BUILD_TARGETS
+
+function get_out_dir() {
+    # cd $SOURCE_DIR
+    # local ver=$(git tag --points-at HEAD)
+    # echo "$VER_OUT_DIR/$ver"
+    echo "$VER_OUT_DIR/${LASTEST_VER}"
+}
+
+if [ ! -d "$SOURCE_DIR" ]; then
+    echo "Source directory '$SOURCE_DIR' not found. Cloning the AndroidAPS repository..."
+    cd "$ROOT_DIR" || {
+        echo "Failed to navigate to $ROOT_DIR. Exiting."
+        return 2
+    }
+
+    git clone https://github.com/nightscout/AndroidAPS.git "$SOURCE_DIR"
+    GIT_RC=$?
+    if [ $GIT_RC -ne 0 ]; then
+        echo "Error cloning the AndroidAPS repository."
+        return $((GIT_RC + 3))
+    fi
+    return 0
+fi
+
+function init_build_targets() {
+    local out; out=$(get_out_dir)
+    BUILD_TARGETS=(
+        [":app:assembleFullRelease"]="$out/AAPS/app-full-release_${LASTEST_VER}.apk"
+        [":app:assembleAapsclientRelease"]="$out/AAPSClient/app-aapsclient-release_${LASTEST_VER}.apk"
+        [":wear:assembleAapsclientRelease"]="$out/WearClient/wear-aapsclient-release_${LASTEST_VER}.apk"
+    )
+}
+
+function genkey() {
+
+    print_step "Key Validate/Generate"
+
+    if [ ! -d "$KEYSTORE_DIR" ]; then
+        echo "Directory '$KEYSTORE_DIR' does not exist. Creating it..."
+        mkdir -p "$KEYSTORE_DIR"
+        if [ $? -ne 0 ]; then
+            echo "Failed to create directory '$KEYSTORE_DIR'. Did not create new Key. Exiting."
+            return 1
+        fi
+    fi
+
+    if keytool -list -keystore "$KEYSTORE_FILE" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+        echo "Key alias '$KEY_ALIAS' exists in keystore '$KEYSTORE_FILE'."
+
+        # Get the validity period of the key
+        local EXPIRY_DATE=$(keytool -list -v -keystore "$KEYSTORE_FILE" -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" |
+            grep "Valid from" | awk -F"until:" '{print $2}' | xargs)
+
+        # Convert expiry date to timestamp for comparison
+        local EXPIRY_TIMESTAMP=$(date -d "$EXPIRY_DATE" +%s)
+        local CURRENT_TIMESTAMP=$(date +%s)
+
+        # Check if the key is still valid
+        if [ "$CURRENT_TIMESTAMP" -lt "$EXPIRY_TIMESTAMP" ]; then
+            echo "Key is valid until $EXPIRY_DATE."
+            return 0
+        else
+            echo "Key '$KEY_ALIAS' in '$KEYSTORE_FILE' has expired."
+        fi
+    else
+        echo "Key alias '$KEY_ALIAS' does not exist in keystore '$KEYSTORE_FILE'."
+    fi
+
+    # Generate a new key
+    echo "Generating a new key..."
+    keytool -genkeypair \
+        -keystore "$KEYSTORE_FILE" \
+        -storepass "$KEYSTORE_PASSWORD" \
+        -keypass "$KEY_PASSWORD" \
+        -alias "$KEY_ALIAS" \
+        -keyalg RSA \
+        -keysize 2048 \
+        -validity 9125 \
+        -dname "$DNAME"
+
+    if [ $? -eq 0 ]; then
+        echo "New key '$KEY_ALIAS' created successfully in '$KEYSTORE_FILE'."
+    else
+        echo "Failed to create key '$KEY_ALIAS'."
+        return 1
+    fi
+}
+
+function refresh_git() {
+
+    print_step "Git pull/clone"
+
+    # If the source directory doesn't exist, clone the repo
+    unset LAST_COMMIT_DATE
+    if [ ! -d "$SOURCE_DIR" ]; then
+        echo "Source directory '$SOURCE_DIR' not found. Cloning the AndroidAPS repository..."
+        cd "$ROOT_DIR" || {
+            echo "Failed to navigate to $ROOT_DIR. Exiting."
+            return 2
+        }
+
+        git clone https://github.com/nightscout/AndroidAPS.git "$SOURCE_DIR"
+        GIT_RC=$?
+        if [ $GIT_RC -ne 0 ]; then
+            echo "Error cloning the AndroidAPS repository."
+            return $((GIT_RC + 3))
+        fi
+        return 0
+    fi
+
+    # Navigate to the source directory
+    cd "$SOURCE_DIR" || {
+        echo "Failed to navigate to $SOURCE_DIR. Exiting."
+        return 2
+    }
+
+    # Reset and checkout master to ensure we're aligned with the latest
+    echo "Ensuring we're at the latest commit on master..."
+    # Just to ensure we reset another branch, so we can switch to master without a hitch
+    git reset --hard
+    git checkout master
+    git reset --hard origin/master
+    
+    if [ "$FORCE_REBUILD" = "true" ]; then
+        echo "Force rebuild requested. Cleaning working directory..."
+        git clean -xfd
+    fi
+
+    # Check the current hash before pulling
+    CURRENT_HASH=$(git rev-parse HEAD)
+    echo "Current commit hash: $CURRENT_HASH"
+
+    # Pull the latest changes from the remote repository
+    echo "Pulling the latest changes from the AndroidAPS repository..."
+    git pull
+    GIT_RC=$?
+    if [ $GIT_RC -ne 0 ]; then
+        echo "Error pulling from the AndroidAPS repository."
+        return $((GIT_RC + 3))
+    fi
+
+    # Get the new commit hash after pulling
+    NEW_HASH=$(git rev-parse HEAD)
+    export LAST_COMMIT_DATE=$(git log -1 --date=short --format=%cd)
+    export LASTEST_VER=$(git describe --tags --abbrev=0)
+    # Compare and notify about new changes
+    if [ "$CURRENT_HASH" != "$NEW_HASH" ]; then
+        echo "New changes were pulled into the repository."
+        return 0
+    else
+        echo "No new changes detected in the repository."
+        return 1
+    fi
+}
+
+function force_clean_cache_fn() {
+
+    print_step "Force clean cache"
+
+    rm -rf "$GRADLE_USER_HOME" "$ANDROID_USER_HOME" "$KOTLIN_USER_HOME"
+    mkdir -p "$GRADLE_USER_HOME" "$ANDROID_USER_HOME" "$KOTLIN_USER_HOME"
+}
+
+
+function _check_if_build_exists_and_validate() {
+
+    print_step "Validate build if it exists"
+    
+    local failed_targets=()
+    local final_exit_code=0
+
+    local apk=$(get_out_dir)/AAPS/app-full-release.apk
+    if [ -f $apk ]; then
+        verify_signed_release $apk && check_zipalign_verification $apk
+        return $?
+    fi
+    return 1
+}
+
+function check_if_latest_build_exists_and_validate() {
+    print_step "Validate build if it exists"
+    
+    local final_exit_code=0
+    local targets_to_remove=()
+    
+    for target in "${!BUILD_TARGETS[@]}"; do
+        local apk="${BUILD_TARGETS[$target]}"
+        
+        if [ -f "$apk" ]; then
+            echo "Found APK: $apk"
+            echo "Validating"
+            if verify_signed_release "$apk" && check_zipalign_verification "$apk"; then
+                echo "Validation passed for $target"
+                targets_to_remove+=("$target")
+            else
+                echo "Validation failed for $target"
+                final_exit_code=$((final_exit_code + 1))
+            fi
+        else
+            echo "APK not found: $apk"
+            final_exit_code=$((final_exit_code + 1))
+        fi
+    done
+    
+    for target in "${targets_to_remove[@]}"; do
+        unset 'BUILD_TARGETS[$target]'
+    done
+    
+    if [ ${#BUILD_TARGETS[@]} -gt 0 ]; then
+        echo "Remaining targets to build: ${!BUILD_TARGETS[*]}"
+        return $final_exit_code
+    fi
+    
+    echo "All builds validated successfully"
+    return 0
+}
+
+function verify_certificate_match() {
+
+    print_step "Verify certificate in apk"
+
+    local apk_file=$1
+
+    # Extract the certificate fingerprint from the APK signature using apksigner
+    local cert_fingerprint
+    cert_fingerprint=$(${TOOLS_DIR}/build-tools/${COMPILE_SDK}/apksigner verify --print-certs "$apk_file" | grep -oP 'SHA-256 digest: \K.*')
+
+    # Extract the public key fingerprint from the keystore using keytool
+    local key_fingerprint
+    key_fingerprint=$(keytool -list -v -keystore "${KEYSTORE_FILE}" -alias "${KEY_ALIAS}" -storepass "${KEY_PASSWORD}" | grep -oP 'SHA256: \K.*' | tr -d ':' | awk '{print tolower($0)}' | tr -d '[:space:]')
+
+    # Check if either fingerprint is empty
+    if [ -z "$cert_fingerprint" ]; then
+        echo "Error: Failed to extract certificate fingerprint from APK."
+        return 1
+    fi
+
+    if [ -z "$key_fingerprint" ]; then
+        echo "Error: Failed to extract key fingerprint from keystore."
+        return 1
+    fi
+
+    echo "Cert : $cert_fingerprint"
+    echo "Key : $key_fingerprint"
+
+    # Compare the fingerprints to ensure they match
+    if [[ "$cert_fingerprint" == "$key_fingerprint" ]]; then
+        echo "Certificate and key match!"
+        return 0
+    else
+        echo "Certificate and key do not match!"
+        return 1
+    fi
+}
+
+function verify_signed_release() {
+    local apk_file=$1
+    local output
+    output=$(${TOOLS_DIR}/build-tools/${COMPILE_SDK}/apksigner verify --verbose "$apk_file")
+
+    echo "Verified schemes:"
+    echo "$output" | grep "Verified using.*scheme.*: true"
+
+    # Check if at least one signing scheme is true
+    if echo "$output" | grep -q "Verified using.*scheme.*: true"; then
+        echo "Valid signing scheme found."
+    else
+        echo "No valid signing scheme found."
+        return 1
+    fi
+
+    # Capture and display the number of signers
+    local signers_count
+    signers_count=$(echo "$output" | grep -oP "Number of signers: \K[0-9]+")
+    echo "Number of signers: $signers_count"
+
+    # Check if the number of signers is greater than or equal to 1
+    if [ "$signers_count" -ge 1 ]; then
+        echo "Valid number of signers: $signers_count"
+    else
+        echo "Invalid number of signers."
+        return 1
+    fi
+
+    # Verify if the certificate matches the key
+    verify_certificate_match "$apk_file"
+    return $?
+}
+
+function check_zipalign_verification() {
+    local apk_file=$1
+
+    # Run the zipalign command and capture the last line of output
+    local result
+    result=$(${TOOLS_DIR}/build-tools/${COMPILE_SDK}/zipalign -c -v 4 "$apk_file" | tail -1)
+
+    # Check if the output contains "Verification successful"
+    if [[ "$result" == *"Verification successful"* ]]; then
+        echo "Zipalign verification successful."
+        return 0
+    else
+        echo "Zipalign verification failed. Output: $result"
+        return 1
+    fi
+}
+
+function mv_to_build_dir_mark_latest() {
+
+    print_step "Move release build to ${VER_OUT_DIR}"
+
+    cd $SOURCE_DIR
+    local out_dir=$(get_out_dir)
+    local commit_epoch=$(git log -1 --date=format-local:%s --format=%cd)
+    local last_ver_epoch=$(cat $VER_OUT_DIR/last_ver_epoch.txt)
+    local ver=$(git tag --points-at HEAD)
+    mkdir -p "$out_dir/AAPS" "$out_dir/AAPSClient" "$out_dir/WearClient"
+    
+    git log -1 >"$out_dir/git_info.txt"
+    echo >>"$out_dir/git_info.txt"
+    git status -sb >>"$out_dir/git_info.txt"
+    echo "Git metadata written to $out_dir/git_info.txt"
+    mv ./app/build/outputs/apk/full/release/* $out_dir/AAPS/.
+    mv ./app/build/outputs/apk/aapsclient/release/* $out_dir/AAPSClient/.
+    mv ./wear/build/outputs/apk/aapsclient/release/* $out_dir/WearClient/.
+
+    for f in AAPS/app-full-release AAPSClient/app-aapsclient-release WearClient/wear-aapsclient-release; do
+        [ -f "$out_dir/$f.apk" ] && mv "$out_dir/$f.apk" "$out_dir/${f}_${LASTEST_VER}.apk"
+    done
+
+    if [[ $(cat $VER_OUT_DIR/last_ver_epoch.txt) -lt $commit_epoch ]]; then
+        echo $commit_epoch >$VER_OUT_DIR/last_ver_epoch.txt
+        ln -nsf $ver $VER_OUT_DIR/latest
+    fi
+    chown -R $CHOWN_WEB_USR:$CHOWN_WEB_GRP "$out_dir"
+    chown -h $CHOWN_WEB_USR:$CHOWN_WEB_GRP $VER_OUT_DIR/latest
+    chown $CHOWN_WEB_USR:$CHOWN_WEB_GRP $VER_OUT_DIR/last_ver_epoch.txt
+
+}
+
+function build_aaps() {
+
+    local sha="$1"
+
+    print_step "Build AAPS"
+
+    cd $SOURCE_DIR
+
+    if [ -n "$sha" ]; then
+        echo "Checking out provided SHA: $sha"
+        git checkout "$sha" || {
+            notify_exit "Error: Failed to checkout SHA $sha"
+        }
+        
+        # Check if this SHA is tagged
+        local ver=$(git tag --points-at HEAD)
+        if [ -z "$ver" ]; then
+            # Not tagged, use short SHA as fallback
+            ver=$(git rev-parse --short HEAD)
+            echo "SHA is not tagged, using short SHA as version: $ver"
+        else
+            echo "Building from tagged SHA, version: $ver"
+        fi
+    else
+        # No SHA provided - check if current HEAD is tagged
+        local ver=$(git tag --points-at HEAD)
+        if [ -z "$ver" ]; then
+            # HEAD not tagged, get latest tag and checkout that SHA
+            latest_tag=$(git describe --tags --abbrev=0)
+            if [ -n "$latest_tag" ]; then
+                echo "HEAD not tagged, checking out latest tag: $latest_tag"
+                git checkout "$latest_tag" || {
+                    notify_exit "Error: Failed to checkout tag $latest_tag"
+                }
+                ver="$latest_tag"
+                echo "Building latest tagged version: $ver"
+            else
+                notify_exit "Error: No tags found in repository and HEAD is not tagged"
+            fi
+        else
+            # HEAD is already tagged
+            echo "Building from current HEAD, version: $ver"
+        fi
+    fi
+    local ver=$(git tag --points-at HEAD)
+
+    if [ -z "$ver" ] ; then
+        echo "HEAD is not tagged, i.e., not a new version, nothing to do... exiting!"
+        exit 0
+    fi
+    
+    if [ "$FORCE_REBUILD" = "true" ]; then
+        echo "Force rebuild requested. Running gradlew clean..."
+        ./gradlew clean
+    fi
+
+    ./gradlew "${!BUILD_TARGETS[@]}" \
+        -Pandroid.injected.signing.store.file=$KEYSTORE_FILE \
+        -Pandroid.injected.signing.store.password=$KEYSTORE_PASSWORD \
+        -Pandroid.injected.signing.key.alias=$KEY_ALIAS \
+        -Pandroid.injected.signing.key.password=$KEY_PASSWORD \
+        --console=plain
+    
+    RC=$?
+    # ./gradlew --stop
+    # Verify success
+    if [ $RC -eq 0 ]; then
+        echo "Build completed successfully. Output available at: $out_dir"
+        response=$(mv_to_build_dir_mark_latest)
+        return 0
+    else
+        notify_exit "Build failed. Check the logs for details."
+    fi
+}
